@@ -213,13 +213,100 @@ export class TelegramChannel implements Channel {
     });
 
     // Command to check bot status
+    this.bot.command('totp', async (ctx) => {
+      const args = (ctx.match || '').trim().split(/\s+/);
+      const action = args[0];
+      if (!action || !['add', 'get', 'list'].includes(action)) {
+        ctx.reply(
+          'Usage: `/totp add <name> <base32-secret>` or `/totp get <name>` or `/totp list`',
+          { parse_mode: 'Markdown' },
+        );
+        return;
+      }
+      let name: string | undefined;
+      let secretArgs: string[] = [];
+      if (action !== 'list') {
+        name = args[1];
+        if (!name) {
+          ctx.reply(`Name required for \`${action}\`.`, {
+            parse_mode: 'Markdown',
+          });
+          return;
+        }
+        secretArgs = action === 'add' ? args.slice(2) : [];
+        if (action === 'add' && secretArgs.length === 0) {
+          ctx.reply('Secret required for `add`.', { parse_mode: 'Markdown' });
+          return;
+        }
+      }
+      const spawnArgs =
+        action === 'list'
+          ? ['scripts/totp.js', 'list']
+          : ['scripts/totp.js', action, name!, ...secretArgs];
+      const { spawn } = await import('child_process');
+      const child = spawn('node', spawnArgs, {
+        cwd: process.cwd(),
+        stdio: 'pipe',
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (data) => (stdout += data));
+      child.stderr.on('data', (data) => (stderr += data));
+      child.on('close', (code) => {
+        if (code !== 0 || stderr.trim()) {
+          ctx.reply(`Error: code ${code} - ${stderr.trim() || 'Unknown'}`, {
+            parse_mode: 'Markdown',
+          });
+          return;
+        }
+        const output = stdout.trim();
+        let reply: string = '';
+        if (action === 'list') {
+          reply = output
+            ? `Stored keys:\n\`\`\`\n${output}\n\`\`\``
+            : 'No keys stored.';
+        } else if (action === 'get') {
+          reply = `Your code: \`${output}\``;
+        } else {
+          reply = `Added/updated TOTP key: \`${name}\``;
+        }
+        ctx.reply(reply, { parse_mode: 'Markdown' });
+      });
+    });
+
+    this.bot.command('help', (ctx) => {
+      ctx.reply(
+        `
+**NanoClaw Telegram Bot Capabilities:**
+
+**Commands:**
+• \`/chatid\` - Get chat ID for registration
+• \`/ping\` - Check bot status
+• \`/preset <name>\` - Apply Claude Code Router preset
+• \`/totp get <name>\` - Get current TOTP code
+• \`/totp add <name> <base32-secret>\` - Add/update TOTP secret
+
+**Regular messages:** Use ${TRIGGER_PATTERN} to trigger assistant.
+
+Send /ping to test.
+  `,
+        { parse_mode: 'Markdown' },
+      );
+    });
+
     this.bot.command('ping', (ctx) => {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
     // Telegram bot commands handled above — skip them in the general handler
     // so they don't also get stored as messages. All other /commands flow through.
-    const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping', 'preset']);
+    const TELEGRAM_BOT_COMMANDS = new Set([
+      'chatid',
+      'ping',
+      'preset',
+      'totp',
+      'help',
+    ]);
 
     this.bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) {
