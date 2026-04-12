@@ -23,6 +23,18 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+/** Parse a Telegram JID (base or virtual topic) into chat ID and optional thread ID. */
+export function parseTelegramJid(jid: string): {
+  chatId: string;
+  threadId?: string;
+} {
+  const topicMatch = jid.match(/^tg:(-?\d+):t:(\d+)$/);
+  if (topicMatch) {
+    return { chatId: topicMatch[1], threadId: topicMatch[2] };
+  }
+  return { chatId: jid.replace(/^tg:/, '') };
+}
+
 /**
  * Send a message with Telegram Markdown parse mode, falling back to plain text.
  * Claude's output naturally matches Telegram's Markdown v1 format:
@@ -119,16 +131,21 @@ export class TelegramChannel implements Channel {
     // Command to get chat ID (useful for registration)
     this.bot.command('chatid', (ctx) => {
       const chatId = ctx.chat.id;
+      const threadId = ctx.message?.message_thread_id;
       const chatType = ctx.chat.type;
       const chatName =
         chatType === 'private'
           ? ctx.from?.first_name || 'Private'
           : (ctx.chat as any).title || 'Unknown';
+      const chatJid = threadId
+        ? `tg:${chatId}:t:${threadId}`
+        : `tg:${chatId}`;
 
-      ctx.reply(
-        `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}`,
-        { parse_mode: 'Markdown' },
-      );
+      let reply = `Chat ID: \`${chatJid}\`\nName: ${chatName}\nType: ${chatType}`;
+      if (threadId) {
+        reply += `\nBase Group: \`tg:${chatId}\`\nTopic ID: ${threadId}`;
+      }
+      ctx.reply(reply, { parse_mode: 'Markdown' });
     });
 
     // Command to apply a preset to the Claude Code router config
@@ -314,7 +331,11 @@ Send /ping to test.
         if (TELEGRAM_BOT_COMMANDS.has(cmd)) return;
       }
 
-      const chatJid = `tg:${ctx.chat.id}`;
+      const baseJid = `tg:${ctx.chat.id}`;
+      const threadId = ctx.message.message_thread_id;
+      // Build virtual JID for forum topic messages
+      const chatJid = threadId ? `${baseJid}:t:${threadId}` : baseJid;
+
       let content = ctx.message.text;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
@@ -324,7 +345,6 @@ Send /ping to test.
         'Unknown';
       const sender = ctx.from?.id.toString() || '';
       const msgId = ctx.message.message_id.toString();
-      const threadId = ctx.message.message_thread_id;
 
       const replyTo = ctx.message.reply_to_message;
       const replyToMessageId = replyTo?.message_id?.toString();
@@ -340,7 +360,7 @@ Send /ping to test.
       const chatName =
         ctx.chat.type === 'private'
           ? senderName
-          : (ctx.chat as any).title || chatJid;
+          : (ctx.chat as any).title || baseJid;
 
       // Translate Telegram @bot_username mentions into TRIGGER_PATTERN format.
       // Telegram @mentions (e.g., @andy_ai_bot) won't match TRIGGER_PATTERN
@@ -362,19 +382,20 @@ Send /ping to test.
         }
       }
 
-      // Store chat metadata for discovery
+      // Store chat metadata for discovery (always use base JID for parent group)
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
       this.opts.onChatMetadata(
-        chatJid,
+        baseJid,
         timestamp,
         chatName,
         'telegram',
         isGroup,
       );
 
-      // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
+      // Check registration: virtual topic JID first, then parent group
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || (threadId ? groups[baseJid] : undefined);
       if (!group) {
         logger.debug(
           { chatJid, chatName },
@@ -383,7 +404,7 @@ Send /ping to test.
         return;
       }
 
-      // Deliver message — startMessageLoop() will pick it up
+      // Deliver message with virtual JID — startMessageLoop() will pick it up
       this.opts.onMessage(chatJid, {
         id: msgId,
         chat_jid: chatJid,
@@ -392,7 +413,6 @@ Send /ping to test.
         content,
         timestamp,
         is_from_me: false,
-        thread_id: threadId ? threadId.toString() : undefined,
         reply_to_message_id: replyToMessageId,
         reply_to_message_content: replyToContent,
         reply_to_sender_name: replyToSenderName,
@@ -410,8 +430,15 @@ Send /ping to test.
       placeholder: string,
       opts?: { fileId?: string; filename?: string },
     ) => {
-      const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
+      const baseJid = `tg:${ctx.chat.id}`;
+      const mediaThreadId = ctx.message.message_thread_id;
+      const chatJid = mediaThreadId
+        ? `${baseJid}:t:${mediaThreadId}`
+        : baseJid;
+
+      const groups = this.opts.registeredGroups();
+      const group =
+        groups[chatJid] || (mediaThreadId ? groups[baseJid] : undefined);
       if (!group) return;
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
@@ -425,7 +452,7 @@ Send /ping to test.
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
       this.opts.onChatMetadata(
-        chatJid,
+        baseJid,
         timestamp,
         undefined,
         'telegram',
@@ -542,9 +569,12 @@ Send /ping to test.
     }
 
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      const options = threadId
-        ? { message_thread_id: parseInt(threadId, 10) }
+      const parsed = parseTelegramJid(jid);
+      const numericId = parsed.chatId;
+      // Thread from virtual JID takes precedence, then explicit threadId param
+      const effectiveThreadId = parsed.threadId || threadId;
+      const options = effectiveThreadId
+        ? { message_thread_id: parseInt(effectiveThreadId, 10) }
         : {};
 
       // Telegram has a 4096 character limit per message — split if needed
@@ -589,8 +619,8 @@ Send /ping to test.
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
+      const { chatId } = parseTelegramJid(jid);
+      await this.bot.api.sendChatAction(chatId, 'typing');
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
